@@ -1,0 +1,366 @@
+#!/bin/bash
+
+_MODULE_DIR="${MODULE_DB_DIR:-$HOME/.module}"
+_MODULE_TMP="${TMPDIR:-/tmp}/_module_$$"
+_MODULE_LOADED="${_MODULE_DIR}/.loaded"
+
+_is_zsh() { [[ -n "${ZSH_VERSION:-}" ]]; }
+
+_get_var() {
+    if _is_zsh; then
+        echo "${(P)1}"
+    else
+        echo "${!1}"
+    fi
+}
+
+_split_colon() {
+    local IFS=':'
+    if _is_zsh; then
+        reply=(${=1})
+    else
+        read -ra reply <<< "$1"
+    fi
+}
+
+_validate_module_name() {
+    if [[ ! "$1" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+        echo "Error: Invalid module name '$1'. Use only alphanumeric, '.', '-', '_' characters." >&2
+        return 1
+    fi
+    return 0
+}
+
+module_init() {
+    if [[ ! -d "${_MODULE_DIR}" ]]; then
+        mkdir -p "${_MODULE_DIR}" || {
+            echo "Error: Cannot create module directory '${_MODULE_DIR}'" >&2
+            return 1
+        }
+    fi
+}
+
+show_usage() {
+    cat <<'EOF'
+Usage: module <command> [module_name] [module_path]
+
+Commands:
+  install <name> [path]  Install a module (defaults to $PWD)
+  remove  <name>         Remove a module from the database
+  load    <name>         Load a module into the environment
+  unload  <name>         Unload a module from the environment
+  swap    <old> <new>    Swap one module for another
+  list                   List currently loaded modules
+  avail                  List available modules with details
+  help                   Show this help message
+EOF
+    return 1
+}
+
+_exact_remove() {
+    local src_str="$1"
+    local to_del="$2"
+    local reply
+    _split_colon "${src_str}"
+    local result=""
+    local val
+    for val in "${reply[@]}"; do
+        if [[ "${val}" != "${to_del}" ]]; then
+            result="${result:+${result}:}${val}"
+        fi
+    done
+    echo "${result}"
+}
+
+_path_contains() {
+    local haystack="$1"
+    local needle="$2"
+    local reply
+    _split_colon "${haystack}"
+    local p
+    for p in "${reply[@]}"; do
+        if [[ "${p}" == "${needle}" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+_loaded_contains() {
+    local name="$1"
+    [[ -f "${_MODULE_LOADED}" ]] || return 1
+    local line
+    while IFS= read -r line; do
+        [[ "${line}" == "${name}" ]] && return 0
+    done < "${_MODULE_LOADED}"
+    return 1
+}
+
+_add_loaded() {
+    local name="$1"
+    if _loaded_contains "${name}"; then
+        return 0
+    fi
+    echo "${name}" >> "${_MODULE_LOADED}"
+}
+
+_remove_loaded() {
+    local name="$1"
+    [[ -f "${_MODULE_LOADED}" ]] || return 0
+    local tmp="${_MODULE_LOADED}.tmp"
+    local line
+    while IFS= read -r line; do
+        [[ "${line}" != "${name}" ]] && echo "${line}"
+    done < "${_MODULE_LOADED}" > "${tmp}"
+    mv "${tmp}" "${_MODULE_LOADED}"
+}
+
+try_to_install() {
+    local db_file_name="$1"
+    local install_path="$2"
+    local variable_name="$3"
+
+    [[ ! -d "${install_path}" ]] && return 0
+
+    if [[ -f "${db_file_name}" ]] && _path_contains "$(<"${db_file_name}")" "${install_path}"; then
+        return 0
+    fi
+
+    printf '%s=%s\n' "${variable_name}" "${install_path}" >> "${db_file_name}"
+}
+
+install_to_db() {
+    local module_name="$1"
+    local module_dir="$2"
+
+    _validate_module_name "${module_name}" || return 1
+
+    if [[ ! -d "${module_dir}" ]]; then
+        echo "Error: '${module_dir}' is not a valid path." >&2
+        return 2
+    fi
+
+    local db_file_name="${_MODULE_DIR}/${module_name}"
+    if [[ -f "${db_file_name}" ]]; then
+        echo "Error: Module '${module_name}' description file already exists" >&2
+        return 3
+    fi
+
+    try_to_install "${db_file_name}" "${module_dir}/bin" PATH
+    try_to_install "${db_file_name}" "${module_dir}/sbin" PATH
+    try_to_install "${db_file_name}" "${module_dir}/include" C_INCLUDE_PATH
+    try_to_install "${db_file_name}" "${module_dir}/include" CPLUS_INCLUDE_PATH
+    try_to_install "${db_file_name}" "${module_dir}/lib" LIBRARY_PATH
+    try_to_install "${db_file_name}" "${module_dir}/lib" LD_LIBRARY_PATH
+    try_to_install "${db_file_name}" "${module_dir}/lib" DYLD_LIBRARY_PATH
+    try_to_install "${db_file_name}" "${module_dir}/lib64" LIBRARY_PATH
+    try_to_install "${db_file_name}" "${module_dir}/lib64" LD_LIBRARY_PATH
+    try_to_install "${db_file_name}" "${module_dir}/lib64" DYLD_LIBRARY_PATH
+    try_to_install "${db_file_name}" "${module_dir}/pkgconfig" PKG_CONFIG_PATH
+}
+
+_do_load() {
+    local module_name="$1"
+    local db_file_name="${_MODULE_DIR}/${module_name}"
+
+    if [[ ! -f "${db_file_name}" ]]; then
+        echo "Error: Module '${module_name}' not found" >&2
+        return 1
+    fi
+
+    local line var_name path_name cur acc
+    local -a seen
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        [[ -z "${line}" ]] && continue
+        var_name="${line%%=*}"
+        path_name="${line#*=}"
+        if [[ " ${seen[*]} " == *" ${var_name} "* ]]; then
+            eval "acc=\${acc__${var_name}}"
+            if ! _path_contains "${acc}" "${path_name}"; then
+                acc="${acc}:${path_name}"
+                eval "acc__${var_name}=\${acc}"
+            fi
+        else
+            cur="$(_get_var "${var_name}")"
+            seen+=("${var_name}")
+            if _path_contains "${cur}" "${path_name}"; then
+                eval "acc__${var_name}=\${cur}"
+            else
+                eval "acc__${var_name}=\${cur:+\${cur}:}${path_name}"
+            fi
+        fi
+    done < "${db_file_name}"
+
+    local vn suffix
+    for vn in "${seen[@]}"; do
+        suffix="acc__${vn}"
+        if _is_zsh; then
+            printf '%s=%s\n' "${vn}" "${(P)suffix}"
+        else
+            printf '%s=%s\n' "${vn}" "${!suffix}"
+        fi
+    done
+}
+
+_do_unload() {
+    local module_name="$1"
+    local db_file_name="${_MODULE_DIR}/${module_name}"
+
+    if [[ ! -f "${db_file_name}" ]]; then
+        echo "Error: Module '${module_name}' not found" >&2
+        return 1
+    fi
+
+    local line var_name path_name cur
+    local -a seen
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        [[ -z "${line}" ]] && continue
+        var_name="${line%%=*}"
+        path_name="${line#*=}"
+        if [[ " ${seen[*]} " == *" ${var_name} "* ]]; then
+            eval "acc=\${acc__${var_name}}"
+            acc=$(_exact_remove "${acc}" "${path_name}")
+            eval "acc__${var_name}=\${acc}"
+        else
+            cur="$(_get_var "${var_name}")"
+            seen+=("${var_name}")
+            acc=$(_exact_remove "${cur}" "${path_name}")
+            eval "acc__${var_name}=\${acc}"
+        fi
+    done < "${db_file_name}"
+
+    local vn suffix
+    for vn in "${seen[@]}"; do
+        suffix="acc__${vn}"
+        if _is_zsh; then
+            printf '%s=%s\n' "${vn}" "${(P)suffix}"
+        else
+            printf '%s=%s\n' "${vn}" "${!suffix}"
+        fi
+    done
+}
+
+_apply_from_file() {
+    local tmpfile="$1"
+    local line variable_name
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] && continue
+        variable_name="${line%%=*}"
+        export "${line}"
+    done < "${tmpfile}"
+}
+
+module() {
+    module_init || return 1
+
+    if [[ $# -lt 1 ]]; then
+        show_usage
+        return 1
+    fi
+
+    local module_command="$1"
+    shift
+
+    case "${module_command}" in
+        install)
+            local module_name="$1"
+            local module_dir="${2:-$PWD}"
+            _validate_module_name "${module_name}" || return 1
+            install_to_db "${module_name}" "${module_dir}" || return $?
+            ;;
+        remove)
+            local module_name="$1"
+            _validate_module_name "${module_name}" || return 1
+            if [[ -f "${_MODULE_DIR}/${module_name}" ]]; then
+                rm "${_MODULE_DIR}/${module_name}"
+            else
+                echo "Error: Module '${module_name}' not found" >&2
+                return 1
+            fi
+            ;;
+        load)
+            local module_name="$1"
+            _validate_module_name "${module_name}" || return 1
+            if ! _do_load "${module_name}" > "${_MODULE_TMP}"; then
+                rm -f "${_MODULE_TMP}"
+                return 1
+            fi
+            _apply_from_file "${_MODULE_TMP}"
+            rm -f "${_MODULE_TMP}"
+            _add_loaded "${module_name}"
+            ;;
+        unload)
+            local module_name="$1"
+            _validate_module_name "${module_name}" || return 1
+            if ! _do_unload "${module_name}" > "${_MODULE_TMP}"; then
+                rm -f "${_MODULE_TMP}"
+                return 1
+            fi
+            _apply_from_file "${_MODULE_TMP}"
+            rm -f "${_MODULE_TMP}"
+            _remove_loaded "${module_name}"
+            ;;
+        swap)
+            local old_module="$1"
+            local new_module="$2"
+            if [[ -z "${old_module}" || -z "${new_module}" ]]; then
+                echo "Error: swap requires two module names" >&2
+                return 1
+            fi
+            _validate_module_name "${old_module}" || return 1
+            _validate_module_name "${new_module}" || return 1
+            if ! _do_unload "${old_module}" > "${_MODULE_TMP}"; then
+                rm -f "${_MODULE_TMP}"
+                return 1
+            fi
+            _apply_from_file "${_MODULE_TMP}"
+            rm -f "${_MODULE_TMP}"
+            local _MODULE_TMP2="${_MODULE_TMP}.2"
+            if ! _do_load "${new_module}" > "${_MODULE_TMP2}"; then
+                rm -f "${_MODULE_TMP2}"
+                return 1
+            fi
+            _apply_from_file "${_MODULE_TMP2}"
+            rm -f "${_MODULE_TMP2}"
+            ;;
+        list)
+            if [[ ! -f "${_MODULE_LOADED}" ]]; then
+                return 0
+            fi
+            local line
+            while IFS= read -r line; do
+                [[ -n "${line}" ]] && echo "${line}"
+            done < "${_MODULE_LOADED}"
+            ;;
+        avail)
+            local f
+            local _glob_old=""
+            if _is_zsh; then
+                for f in "${_MODULE_DIR}"/*(N); do
+                    [[ -f "${f}" ]] || continue
+                    echo "$(basename "${f}")"
+                done
+            else
+                _glob_old=$(shopt -p nullglob 2>/dev/null)
+                shopt -s nullglob
+                for f in "${_MODULE_DIR}"/*; do
+                    [[ -f "${f}" ]] || continue
+                    echo "$(basename "${f}")"
+                done
+                eval "${_glob_old}"
+            fi
+            ;;
+        help|--help|-h)
+            show_usage
+            ;;
+        *)
+            echo "Error: Unknown command '${module_command}'" >&2
+            show_usage >&2
+            return 1
+            ;;
+    esac
+}
+
+if [[ $# -gt 0 ]]; then
+    module "$@"
+fi

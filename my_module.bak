@@ -1,0 +1,185 @@
+#!/bin/bash
+
+function module_init
+{
+    db_dir=~/.module
+    if [ ! -d ${db_dir} ]
+    then
+	    mkdir ${db_dir}
+    fi
+}
+
+function show_usage
+{
+    echo 'Usage: module [command] module_name'
+    return 1
+}
+
+function try_to_install
+{
+    local  db_file_name=$1
+    local  install_path=$2
+    local variable_name=$3
+    
+    touch   ${db_file_name}
+    if [ -d ${install_path} ]
+    then
+	    echo ${variable_name}'='${install_path} \
+	         >> ${db_file_name}
+    fi
+}
+
+function install_to_db
+{
+    local module_name=$1
+    local module_dir=$2
+
+    if [ ! -d ${module_dir} ]
+    then
+	    echo 'Error: "'${module_dir}'" is not a valid path.'
+	    return 2
+    fi
+
+    local db_file_name=${db_dir}/${module_name}
+    if [ -f ${db_file_name} ]
+    then
+	    echo 'Error: Module "' ${module_name} \
+	         '" discription file already exists'
+	    return 3
+    fi
+
+    try_to_install ${db_file_name} ${module_dir}/bin PATH
+    try_to_install ${db_file_name} ${module_dir}/sbin PATH
+    try_to_install ${db_file_name} ${module_dir}/include C_INCLUDE_PATH
+    try_to_install ${db_file_name} ${module_dir}/include CPLUS_INCLUDE_PATH
+    try_to_install ${db_file_name} ${module_dir}/lib LIBRARY_PATH
+    try_to_install ${db_file_name} ${module_dir}/lib LD_LIBRARY_PATH    
+    try_to_install ${db_file_name} ${module_dir}/lib DYLD_LIBRARY_PATH    
+    try_to_install ${db_file_name} ${module_dir}/lib64 LIBRARY_PATH    
+    try_to_install ${db_file_name} ${module_dir}/lib64 LD_LIBRARY_PATH    
+    try_to_install ${db_file_name} ${module_dir}/lib64 DYLD_LIBRARY_PATH    
+    try_to_install ${db_file_name} ${module_dir}/pkgconfig PKG_CONFIG_PATH    
+}
+
+function load_module
+{
+    local module_name=$1
+    local db_file_name=${db_dir}/${module_name}
+
+    ret_str=""
+    
+    cat ${db_file_name} | while read line
+    do
+	    if [ -z ${line} ]
+	    then
+	        continue
+	    fi
+        local variable_name=${line%%=*}
+	    local path_name=${line#*=}
+	    local original_path_cmd='echo ${'${variable_name}'}'
+	    local original_path=`eval ${original_path_cmd}`
+        # local original_parts=("${(s/:/)original_path}") # zsh only
+        local original_parts=($(echo "${original_path}" | tr ':' '\n'))
+        if [[ " ${original_parts[*]} " =~ " ${path_name} "  ]]
+	    then
+	        continue
+	    fi
+        local command=${variable_name}'=${'${variable_name}':+${'${variable_name}'}:}'${path_name}
+        echo ${command}'^'
+    done
+}
+
+function exact_remove
+{
+    local src_str=$1
+    local to_del=$2
+    local parts=($(echo "${src_str}" | tr ':' '\n'))
+    local mod_parts=()
+    for val in "${parts[@]}"
+    do
+        if [[ "${val}" != "${to_del}" ]]
+        then
+           mod_parts+=("${val}")
+        fi
+    done
+    local mod_str=$(printf ":%s" "${mod_parts[@]}")
+    mod_str=${mod_str:1}
+    echo ${mod_str}
+}
+
+function unload_module
+{
+    local module_name=$1
+    
+    local db_file_name=${db_dir}/${module_name}
+    cat ${db_file_name} | while read line
+    do
+	    if [ -z ${line} ]
+	    then
+	        continue
+	    fi
+        local variable_name=${line%%=*}
+	    local path_name=${line#*=}
+        local command=${variable_name}'=$(exact_remove ${'${variable_name}'} '${path_name}')'
+        echo ${command// /'#'}'^'
+    done
+}
+
+######################################################################
+# Main
+module_init
+
+if [ $# -eq 1 ]
+then
+    case $1 in
+	    'avail' )
+	        ls ${db_dir}
+	        return 0
+	        ;;
+	    * )
+	        show_usage
+	        ;;
+    esac
+elif [ $# -gt 3 ] || [ $# -lt 1 ]
+then
+    show_usage
+    return 1
+fi
+
+module_command=$1
+module_name=$2
+
+
+case ${module_command} in
+    'install' )
+	    if [ $# -eq 3 ]
+	    then
+	        module_dir=$3
+	    else
+	        module_dir=${PWD}
+	    fi
+	    install_to_db ${module_name} ${module_dir}
+	    ;;
+    'remove' )
+	    if [ -f ${db_dir}/${module_name} ]
+	    then
+	        rm ${db_dir}/${module_name}
+	    fi
+	    ;;
+    'load' )
+        global_cmd_str=`load_module ${module_name}`
+	    ;;
+    'unload' )
+	    global_cmd_str=`unload_module ${module_name}`
+	    ;;
+    * )
+	    show_usage
+	    ;;
+esac
+
+global_cmd=($(echo "${global_cmd_str}" | tr '^' '\n'))
+for val in "${global_cmd[@]}"
+do
+    exporter=${val//'#'/ }
+    eval "export ${exporter}"
+done

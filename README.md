@@ -2,7 +2,7 @@
 
 A lightweight module system that manages environment variables (PATH, library paths, include paths) when loading/unloading software modules. Works in both **bash** and **zsh**.
 
-I have been using the old my_module.bak for many years since I wrote it in 2013 when I started my grad school in Princeton astro, and the new my_module is the updated version using OpenCode + GLM 5.1. 
+I have been using the old my_module.bak for many years since I wrote it in 2013 when I started my grad school in Princeton astro (where I really needed this on my office desktop due to their security policies), and the new my_module is the updated version using OpenCode + GLM 5.1. 
 
 ## Quick start
 
